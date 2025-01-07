@@ -2,8 +2,10 @@ import os
 import json
 import boto3
 import requests
+from decimal import Decimal
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from botocore.exceptions import ClientError
 
 # Load environment variables
 load_dotenv()
@@ -14,7 +16,41 @@ class WeatherDashboard:
         self.bucket_name = os.getenv('AWS_BUCKET_NAME')
         self.s3_client = boto3.client('s3')
         self.dynamodb = boto3.resource('dynamodb')
-        self.table = self.dynamodb.Table('WeatherForecasts')
+        self.table_name = 'WeatherForecasts'
+        self.table = self.create_dynamo_table()
+
+    def create_dynamo_table(self):
+        """Create DynamoDB table if it doesn't exist"""
+        try:
+            table = self.dynamodb.create_table(
+                TableName=self.table_name,
+                KeySchema=[
+                    {
+                        'AttributeName': 'CityDate',
+                        'KeyType': 'HASH'
+                    }
+                ],
+                AttributeDefinitions=[
+                    {
+                        'AttributeName': 'CityDate',
+                        'AttributeType': 'S'
+                    }
+                ],
+                ProvisionedThroughput={
+                    'ReadCapacityUnits': 5,
+                    'WriteCapacityUnits': 5
+                }
+            )
+            table.meta.client.get_waiter('table_exists').wait(TableName=self.table_name)
+            print(f"Table {self.table_name} created successfully.")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ResourceInUseException':
+                print(f"Table {self.table_name} already exists.")
+                table = self.dynamodb.Table(self.table_name)
+            else:
+                print(f"Unexpected error: {e}")
+                raise
+        return table
 
     def fetch_weather(self, city):
         """Fetch current weather data from OpenWeather API"""
@@ -78,22 +114,40 @@ class WeatherDashboard:
             return False
 
         try:
-            for forecast in forecast_data['list']:
-                item = {
-                    'CityDate': f"{city}#{forecast['dt']}",
-                    'City': city,
-                    'Timestamp': forecast['dt'],
-                    'Temperature': forecast['main']['temp'],
-                    'FeelsLike': forecast['main']['feels_like'],
-                    'Humidity': forecast['main']['humidity'],
-                    'Description': forecast['weather'][0]['description']
-                }
-                self.table.put_item(Item=item)
+            with self.table.batch_writer() as batch:
+                for forecast in forecast_data['list']:
+                    item = {
+                        'CityDate': f"{city}#{forecast['dt']}",
+                        'City': city,
+                        'Timestamp': forecast['dt'],
+                        'Temperature': Decimal(str(forecast['main']['temp'])),
+                        'FeelsLike': Decimal(str(forecast['main']['feels_like'])),
+                        'Humidity': Decimal(str(forecast['main']['humidity'])),
+                        'Description': forecast['weather'][0]['description']
+                    }
+                    batch.put_item(Item=item)
             print(f"Successfully saved forecast for {city} to DynamoDB")
             return True
         except Exception as e:
             print(f"Error saving to DynamoDB: {e}")
             return False
+
+    def get_daily_forecasts(self, forecast_data):
+        """Extract one forecast per day for the next 5 days"""
+        daily_forecasts = []
+        current_date = datetime.now().date()
+        for forecast in forecast_data['list']:
+            forecast_date = datetime.fromtimestamp(forecast['dt']).date()
+            if forecast_date > current_date and len(daily_forecasts) < 5:
+                if not daily_forecasts or forecast_date > daily_forecasts[-1]['date']:
+                    daily_forecasts.append({
+                        'date': forecast_date,
+                        'temp': forecast['main']['temp'],
+                        'feels_like': forecast['main']['feels_like'],
+                        'humidity': forecast['main']['humidity'],
+                        'description': forecast['weather'][0]['description']
+                    })
+        return daily_forecasts
 
 def main():
     dashboard = WeatherDashboard()
@@ -128,11 +182,10 @@ def main():
                 print(f"Forecast data for {city} saved to DynamoDB!")
 
             # Display forecast summary
-            for forecast in forecast_data['list'][:5]:  # Display next 5 forecasts
-                date = datetime.fromtimestamp(forecast['dt'])
-                temp = forecast['main']['temp']
-                description = forecast['weather'][0]['description']
-                print(f"{date.strftime('%Y-%m-%d %H:%M')}: {temp}°F, {description}")
+            daily_forecasts = dashboard.get_daily_forecasts(forecast_data)
+            print(f"\n5-day forecast for {city}:")
+            for forecast in daily_forecasts:
+                print(f"{forecast['date'].strftime('%Y-%m-%d')}: {forecast['temp']}°F, {forecast['description']}")
         else:
             print(f"Failed to fetch forecast data for {city}")
 
